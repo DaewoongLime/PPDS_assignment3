@@ -327,7 +327,7 @@ def run_deepseek_enrichment(
         match_metadata = matches_by_id.get(match_id, {})
         
         # Load raw Reddit bundle data saved by main.py
-        reddit_bundle_path = os.path.join("data", "raw", f"reddit_{match_id}.json")
+        reddit_bundle_path = os.path.join("data", "raw", "reddit", f"{match_id}.json")
         reddit_bundle = {"posts": [], "comments": []}
         
         if os.path.exists(reddit_bundle_path):
