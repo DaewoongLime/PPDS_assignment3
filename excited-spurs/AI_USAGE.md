@@ -14,13 +14,13 @@ This document records **how AI tools were used** during development, **what AI g
 ## 📦 Project Areas Where AI Was Used
 | Area | AI Involvement | Final Ownership |
 |---|---|---|
-| Requirements shaping (scope, sources, outputs) | High – iterated on idea, constraints, repo layout | Human reviewed & accepted |
-| Web scraping (Transfermarkt) | Medium – helped design selectors & fallbacks | Human refined, tested, and validated |
-| Reddit data collection | Medium – designed query strategy, deduping, local date filtering | Human tuned limits & windows |
-| Data cleaning (pandas) | Medium – column validation, first‑team filtering | Human finalized rules |
+| Requirements shaping (scope, sources, outputs) | Low – helped develop original idea into a product | Human reviewed & finalized |
+| Web scraping (Transfermarkt) | High – helped design selectors & fallbacks | Human refined, tested, and validated |
+| Reddit data collection | High – designed query strategy, deduping, local date filtering | Human tuned limits & windows |
+| Data cleaning (pandas) | High – column validation, first‑team filtering | Human finalized rules |
 | DeepSeek enrichment module | High – prompts, JSON schema, fallback logic, parsing | Human integrated & tested |
 | Orchestration (ETL in `main.py`) | Medium – pipeline stages & I/O helpers | Human wiring & final checks |
-| Documentation (README / DEEPSEEK_USAGE / AI_USAGE) | High – initial drafts | Human edits & approvals |
+| Documentation (README / DEEPSEEK_USAGE / AI_USAGE) | Medium – initial drafts | Human edits & approvals |
 
 ---
 

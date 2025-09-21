@@ -42,8 +42,8 @@ The output provides per-match excitement levels, tags, summaries, and reasoning 
 
 ### 1. Clone Repo
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/DaewoongLime/PPDS_assignment3.git
+cd PPDS_assignment3
 ```
 
 ### 2. Virtual Environment & Dependencies
