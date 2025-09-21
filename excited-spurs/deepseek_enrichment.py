@@ -2,12 +2,10 @@
 # Python 3.8+ compatible
 
 import os
-import re
 import json
 import requests
 import pandas as pd
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 
 # Optional: load .env if present
 try:

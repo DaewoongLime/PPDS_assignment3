@@ -1,0 +1,6 @@
+match_id,date,home_team,away_team,venue,competition,result,attendance,outcome,is_finished,raw_cells
+2025-08-13_Paris_Saint-Germain_vs_Tottenham_Hotspur,2025-08-13,Paris Saint-Germain,Tottenham Hotspur,Away,UEFA Super Cup,6:5 on pens,21025.0,Loss,True,"['', '', 'Final', 'Wed 13.08.2025', 'A', '', '', 'PSG', '21.025', '6:5 on pens']"
+2025-08-16_Tottenham_Hotspur_vs_Burnley_FC,2025-08-16,Tottenham Hotspur,Burnley FC,Home,Premier League,3:0,61077.0,Win,True,"['', '', '1', 'Sat 16.08.2025', 'H', '(2.)', '', 'Burnley (16.)', '61.077', '3:0']"
+2025-08-16_Tottenham_Hotspur_vs_Reading_FC_U18,2025-08-16,Tottenham Hotspur,Reading FC U18,Home,U18 Premier League,2:2,1.0,Draw,True,"['', 'U18', '1', 'Sat 16.08.2025', 'H', '(7.)', '', 'Reading U18 (13.)', '', '2:2']"
+2025-08-18_Sunderland_AFC_U21_vs_Tottenham_Hotspur,2025-08-18,Sunderland AFC U21,Tottenham Hotspur,Away,Premier League 2,3:5,512.0,Win,True,"['', 'U21', '1', 'Mon 18.08.2025', 'A', '(5.)', '', 'Sunderland U21 (27.)', '512', '3:5']"
+2025-08-22_Tottenham_Hotspur_vs_Crystal_Palace_U21,2025-08-22,Tottenham Hotspur,Crystal Palace U21,Home,Premier League 2,2:3,416.0,Loss,True,"['', 'U21', '2', 'Fri 22.08.2025', 'H', '(3.)', '', 'Palace U21 (17.)', '416', '2:3']"
