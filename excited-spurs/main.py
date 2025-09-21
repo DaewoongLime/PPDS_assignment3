@@ -1,5 +1,5 @@
 # main.py - Spurs fixtures scraper + Reddit reactions + AI enrichment
-# Python 3.8+ compatible ETL pipeline
+# Python 3.8+ compatible single-file pipeline
 
 import os
 import re
@@ -10,42 +10,45 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
-from deepseek_enrichment import *
+from deepseek_enrichment import run_deepseek_enrichment, print_deepseek_results
 
-# Load .env environment variables
+# Load .env (Reddit / DeepSeek keys)
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# Optional dependencies
+# Optional progress bar
 try:
     from tqdm import tqdm
     TQDM = True
 except Exception:
     TQDM = False
 
-# Optional dateparser usage
+# Optional date parsing
 try:
     from dateparser import parse as dparse
 except Exception:
     dparse = None
 
-# Optional PRAW usage
+# Reddit API (PRAW)
 try:
     import praw
 except Exception:
     praw = None
 
-# --------------------------- Configuration ---------------------------
-TEAM = "Tottenham Hotspur"
-TRANSFERMARKT_URL = ("https://www.transfermarkt.com/tottenham-hotspur/"
-                     "vereinsspielplan/verein/148/saison_id/2025/heim_gast/")
 
-# File paths following assignment structure
+# ============================ CONFIG ==================================
+TEAM = "Tottenham Hotspur"
+TRANSFERMARKT_URL = (
+    "https://www.transfermarkt.com/tottenham-hotspur/"
+    "vereinsspielplan/verein/148/saison_id/2025/heim_gast/"
+)
+
+# File paths
 RAW_TRANSFERMARKT = "data/raw/transfermarkt_raw.csv"
-RAW_REDDIT_DIR = "data/raw/reddit/"
+RAW_REDDIT_DIR = "data/raw/reddit"
 ENRICHED_MATCHES = "data/enriched/transfermarkt_matches.csv"
 ENRICHED_REDDIT = "data/enriched/reddit_metrics.csv"
 FINAL_SCORES = "data/enriched/excitement_scores.csv"
@@ -53,391 +56,268 @@ FINAL_SCORES = "data/enriched/excitement_scores.csv"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SpursScraper/0.1)"}
 
 
-# --------------------------- Helper Functions ---------------------------
+# ============================ HELPERS =================================
 def ensure_directory(path: str) -> None:
-    """Ensure directory exists for the given file path."""
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
 
-
-def save_csv(dataframe: pd.DataFrame, path: str) -> None:
-    """Save DataFrame to CSV with proper encoding."""
+def save_csv(df: pd.DataFrame, path: str) -> None:
     ensure_directory(path)
-    dataframe.to_csv(path, index=False, encoding="utf-8")
-
+    df.to_csv(path, index=False, encoding="utf-8")
 
 def save_json(obj: Any, path: str) -> None:
-    """Save object to JSON file with proper encoding."""
     ensure_directory(path)
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(obj, file, ensure_ascii=False, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
 
-
-def parse_date(date_string: str) -> Optional[str]:
-    """Parse date string and return ISO format date."""
-    date_string = (date_string or "").strip()
-    if not date_string:
+def parse_date(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    if not s:
         return None
-    
-    # Try dateparser first if available
     if dparse:
-        parsed_date = dparse(date_string, languages=["en", "de"])
-        if parsed_date:
-            return parsed_date.date().isoformat()
-    
-    # Fallback regex parsing
-    match = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})", date_string)
-    if match:
-        day, month, year = match.groups()
-        year = "20" + year if len(year) == 2 else year
+        dt = dparse(s, languages=["en", "de"])
+        if dt:
+            return dt.date().isoformat()
+    m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})", s)
+    if m:
+        d_, m_, y = m.groups()
+        y = "20" + y if len(y) == 2 else y
         try:
-            return datetime(int(year), int(month), int(day)).date().isoformat()
+            return datetime(int(y), int(m_), int(d_)).date().isoformat()
         except Exception:
-            pass
+            return None
     return None
 
-# --------------------------- Main ETL Functions ---------------------------
-def scrape_raw_transfermarkt(url: str) -> pd.DataFrame:
-    """
-    Scrape ALL Transfermarkt match data without filtering.
-    
-    This is the EXTRACT phase - collect everything first,
-    clean in a separate step.
-    """
-    response = requests.get(url, headers=HEADERS, timeout=30)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "lxml")
+def to_epoch_time(dt: datetime) -> int:
+    return int(dt.replace(tzinfo=timezone.utc).timestamp())
 
-    rows = []
-    last_competition = ""
-    
-    for table_row in soup.select(".responsive-table table tbody tr"):
-        cells = table_row.find_all("td")
-        if not cells:
+
+# ====================== TRANSFERMARKT SCRAPER =========================
+def scrape_raw_transfermarkt(url: str) -> pd.DataFrame:
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+
+    rows, last_comp = [], ""
+    for tr in soup.select(".responsive-table table tbody tr"):
+        tds = tr.find_all("td")
+        if not tds:
             continue
 
-        # Extract result (if match is finished)
+        # Result (finished only)
         result = None
-        for cell in reversed(cells):
-            text = cell.get_text(" ", strip=True)
-            score_match = re.search(r"\b(\d+\s*[:\-]\s*\d+)\b(.*)", text)
-            if score_match:
-                score = re.sub(r'\s+', '', score_match.group(1))
-                extra_info = score_match.group(2).strip()
-                result = f"{score} {extra_info}".strip()
+        for td in reversed(tds):
+            txt = td.get_text(" ", strip=True)
+            m = re.search(r"\b(\d+)\s*[:\-]\s*(\d+)\b", txt)
+            if m:
+                result = m.group(0).replace(" ", "")
                 break
 
-        # Extract competition
-        competition = ""
-        comp_img = table_row.select_one('td img[alt]')
+        # Competition
+        comp = ""
+        comp_img = tr.select_one('td img[alt]')
         if comp_img:
-            competition = comp_img.get("alt", "").strip()
-        if not competition:
-            comp_link = table_row.select_one('a[href*="/wettbewerb/"]')
-            if comp_link:
-                title = comp_link.get("title") or comp_link.get_text(strip=True)
-                competition = title.strip()
-        if competition.isdigit() or competition == "":
-            competition = last_competition
+            comp = comp_img.get("alt", "").strip()
+        if not comp:
+            comp_a = tr.select_one('a[href*="/wettbewerb/"]')
+            if comp_a:
+                comp = (comp_a.get("title") or comp_a.get_text(strip=True)).strip()
+        if comp.isdigit() or comp == "":
+            comp = last_comp
         else:
-            last_competition = competition
+            last_comp = comp
 
-        # Extract date
+        # Date
         date_iso = None
-        time_tag = table_row.find("time")
-        if time_tag and time_tag.get_text(strip=True):
-            date_iso = parse_date(time_tag.get_text(strip=True))
+        t = tr.find("time")
+        if t and t.get_text(strip=True):
+            date_iso = parse_date(t.get_text(strip=True))
         if not date_iso:
-            for cell in cells:
-                text = cell.get_text(" ", strip=True)
-                date_pattern = (r"\d{1,2}[./]\d{1,2}[./]\d{2,4}|"
-                               r"[A-Za-z]{3,}\s+\d{1,2},\s*\d{4}")
-                if re.search(date_pattern, text):
-                    date_iso = parse_date(text)
-                    if date_iso:
-                        break
+            for td in tds:
+                txt = td.get_text(" ", strip=True)
+                if re.search(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}|[A-Za-z]{3,}\s+\d{1,2},\s*\d{4}", txt):
+                    date_iso = parse_date(txt); break
 
-        # Extract venue (Home/Away)
+        # Venue (H/A)
         venue = ""
-        for cell in cells:
-            venue_text = cell.get_text(" ", strip=True).upper()
-            if venue_text in ("H", "A"):
-                venue = "Home" if venue_text == "H" else "Away"
-                break
+        for td in tds:
+            v = td.get_text(" ", strip=True).upper()
+            if v in ("H","A"):
+                venue = "Home" if v=="H" else "Away"; break
 
-        # Extract opponent
+        # Opponent
         opponent = ""
-        club_links = [link for link in table_row.select('a[href*="/verein/"]') 
-                     if link.get_text(strip=True)]
-        for link in club_links:
-            name = (link.get("title") or link.get_text(strip=True)).strip()
+        club_links = [a for a in tr.select('a[href*="/verein/"]') if a.get_text(strip=True)]
+        for a in club_links:
+            name = (a.get("title") or a.get_text(strip=True)).strip()
             if TEAM.lower() not in name.lower():
-                opponent = name
-                break
-        
+                opponent = name; break
         if not opponent:
-            for cell in cells:
-                text = cell.get_text(" ", strip=True)
-                if (len(text) > 2 and ":" not in text and 
-                    not re.fullmatch(r"\d+", text) and 
-                    TEAM.lower() not in text.lower()):
-                    opponent = text.strip()
-                    break
+            for td in tds:
+                txt = td.get_text(" ", strip=True)
+                if len(txt)>2 and ":" not in txt and TEAM.lower() not in txt.lower():
+                    opponent = txt.strip(); break
 
-        # Extract attendance
+        # Attendance (max numeric in row; later we validate)
         attendance = None
-        attendance_candidates = []
-        for cell in cells:
-            raw_text = cell.get_text("", strip=True).replace(".", "")
-            raw_text = raw_text.replace(",", "")
-            if raw_text.isdigit():
-                attendance_candidates.append(int(raw_text))
-        if attendance_candidates:
-            attendance = max(attendance_candidates)
+        nums = []
+        for td in tds:
+            raw = td.get_text("", strip=True).replace(".","").replace(",","")
+            if raw.isdigit():
+                nums.append(int(raw))
+        if nums: attendance = max(nums)
 
-        # Determine home/away teams
+        # Home/Away teams
         if venue == "Home":
             home_team, away_team = TEAM, opponent
-        elif venue == "Away":
-            home_team, away_team = opponent, TEAM
         else:
-            home_team, away_team = TEAM, opponent
+            home_team, away_team = opponent, TEAM
 
-        # Determine match outcome
-        outcome = None
+        # Outcome (Win/Loss/Draw for Spurs)
+        outcome = "Unknown"
         try:
-            goals = result.replace(" ", ":").split(":")
-            g_home, g_away = int(goals[0]), int(goals[1])
-            if home_team == TEAM:  # Spurs were home
-                if g_home > g_away:
-                    outcome = "Win"
-                elif g_home < g_away:
-                    outcome = "Loss"
-                else:
-                    outcome = "Draw"
-            else:  # Spurs were away
-                if g_away > g_home:
-                    outcome = "Win"
-                elif g_away < g_home:
-                    outcome = "Loss"
-                else:
-                    outcome = "Draw"
+            gh, ga = map(int, result.replace("-", ":").split(":"))
+            if home_team == TEAM:
+                outcome = "Win" if gh>ga else "Loss" if gh<ga else "Draw"
+            else:
+                outcome = "Win" if ga>gh else "Loss" if ga<gh else "Draw"
         except Exception:
-            outcome = "Unknown"
+            pass
 
-        # Create match ID
-        date_part = date_iso or 'NODATE'
-        home_part = (home_team or 'UNKNOWN').replace(" ", "_")
-        away_part = (away_team or 'UNKNOWN').replace(" ", "_")
-        match_id = f"{date_part}_{home_part}_vs_{away_part}"
-        
-        # Store raw data with debugging info
-        row_data = {
+        match_id = f"{date_iso}_{home_team.replace(' ','_')}_vs_{away_team.replace(' ','_')}"
+        rows.append({
             "match_id": match_id,
             "date": date_iso,
             "home_team": home_team,
             "away_team": away_team,
             "venue": venue,
-            "competition": competition,
+            "competition": comp,
             "result": result,
             "attendance": attendance,
             "outcome": outcome,
             "is_finished": bool(result),
-            "raw_cells": str([cell.get_text(" ", strip=True) for cell in cells])
-        }
-        rows.append(row_data)
-
+        })
     return pd.DataFrame(rows)
 
 
 def clean_transfermarkt_data(raw_csv: str) -> pd.DataFrame:
-    """
-    TRANSFORM phase: Clean raw Transfermarkt data.
-    
-    Filter to finished first-team matches only.
-    Remove youth/reserve games and validate data quality.
-    """
     if not os.path.exists(raw_csv):
-        raise FileNotFoundError(f"{raw_csv} not found. Run scraper first.")
-    
-    raw_df = pd.read_csv(raw_csv)
-    print(f"Raw Transfermarkt data: {len(raw_df)} rows")
-    
-    # Filter to finished matches
-    finished_df = raw_df[raw_df['is_finished'] == True].copy()
-    print(f"Finished matches: {len(finished_df)} rows")
-    
-    # Remove rows with missing essential data
-    essential_columns = ['date', 'home_team', 'away_team', 'result']
-    clean_df = finished_df.dropna(subset=essential_columns).copy()
-    print(f"Complete data: {len(clean_df)} rows")
-    
-    # First team filter
-    youth_pattern = re.compile(
-        r"\b(U18|U19|U21|U23|Youth|UEFA U19|PL2|Premier League 2)\b", re.I
-    )
-    
-    def is_first_team_match(row):
-        opponent_team = (str(row.get('away_team', '')) if 
-                        row.get('venue') == 'Home' else 
-                        str(row.get('home_team', '')))
-        competition = str(row.get('competition', ''))
-        
-        if youth_pattern.search(opponent_team) or youth_pattern.search(competition):
+        raise FileNotFoundError(f"{raw_csv} not found")
+    raw = pd.read_csv(raw_csv)
+
+    finished = raw[raw["is_finished"]==True].copy()
+    essentials = ["date","home_team","away_team","result"]
+    finished = finished.dropna(subset=essentials)
+
+    # first team filter
+    youth = re.compile(r"\b(U18|U19|U21|U23|Youth|UEFA U19|PL2|Premier League 2)\b", re.I)
+    def is_first(row):
+        opp = row["away_team"] if row["venue"]=="Home" else row["home_team"]
+        if youth.search(str(opp)) or youth.search(str(row["competition"])):
             return False
-        if re.search(r"\bEFL Trophy\b", competition, re.I):
+        if re.search(r"\bEFL Trophy\b", str(row["competition"]), re.I):
             return False
         return True
-    
-    first_team_df = clean_df[clean_df.apply(is_first_team_match, axis=1)].copy()
-    print(f"First team matches: {len(first_team_df)} rows")
-    
-    # Clean attendance data
-    def validate_attendance(attendance):
-        if pd.isna(attendance) or attendance == 0:
+    ft = finished[finished.apply(is_first, axis=1)].copy()
+
+    def val_att(x):
+        try:
+            x = int(x)
+            return x if 1000 <= x <= 200000 else None
+        except Exception:
             return None
-        if 1000 <= attendance <= 200000:
-            return int(attendance)
-        return None
-    
-    first_team_df['attendance'] = first_team_df['attendance'].apply(validate_attendance)
-    
-    # Remove debugging columns and duplicates
-    final_columns = ['match_id', 'date', 'home_team', 'away_team', 
-                    'venue', 'competition', 'result', 'attendance', 'outcome']
-    final_df = first_team_df[final_columns].drop_duplicates(subset=['match_id'])
-    final_df = final_df.reset_index(drop=True)
-    
-    print(f"Final clean dataset: {len(final_df)} rows")
-    return final_df
+    ft["attendance"] = ft["attendance"].apply(val_att)
+
+    cols = ["match_id","date","home_team","away_team","venue","competition","result","attendance","outcome"]
+    return ft[cols].drop_duplicates(subset=["match_id"]).reset_index(drop=True)
 
 
+# ============================ REDDIT =================================
 def initialize_reddit() -> Any:
-    """Initialize Reddit API client."""
     if not praw:
-        raise RuntimeError("praw not installed. Run: pip install praw")
-    
-    client_id = os.getenv("REDDIT_CLIENT_ID")
-    client_secret = os.getenv("REDDIT_CLIENT_SECRET")
-    user_agent = os.getenv("REDDIT_USER_AGENT", "excited-spurs/0.1")
-    
-    if not (client_id and client_secret):
-        error_msg = ("Please set REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET "
-                    "environment variables in .env")
-        raise RuntimeError(error_msg)
-    
-    return praw.Reddit(client_id=client_id, client_secret=client_secret, 
-                      user_agent=user_agent)
-
-
-def to_epoch_time(datetime_obj: datetime) -> int:
-    """Convert datetime to epoch timestamp."""
-    return int(datetime_obj.replace(tzinfo=timezone.utc).timestamp())
-
+        raise RuntimeError("praw not installed. pip install praw")
+    cid = os.getenv("REDDIT_CLIENT_ID")
+    csec = os.getenv("REDDIT_CLIENT_SECRET")
+    ua = os.getenv("REDDIT_USER_AGENT","excited-spurs/0.1")
+    if not (cid and csec):
+        raise RuntimeError("Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in .env")
+    return praw.Reddit(client_id=cid, client_secret=csec, user_agent=ua)
 
 def generate_team_aliases(team_name: str) -> List[str]:
-    """Generate comprehensive team abbreviations and aliases."""
-    base_name = team_name.strip()
-    lowercase_name = base_name.lower()
-    
-    common_aliases: Dict[str, List[str]] = {
-        "tottenham hotspur": ["Tottenham", "Spurs", "TOT"],
-        "manchester city": ["Manchester City", "Man City", "MCFC", "City"],
-        "manchester united": ["Manchester United", "Man United", "Man Utd", 
-                             "MUFC", "United"],
-        "newcastle united": ["Newcastle", "NUFC"],
-        "west ham united": ["West Ham", "WHUFC", "West Ham United"],
-        "brighton & hove albion": ["Brighton", "BHAFC", "Brighton & Hove Albion"],
-        "liverpool": ["Liverpool", "LFC"],
-        "arsenal": ["Arsenal", "AFC"],
-        "chelsea": ["Chelsea", "CFC"],
-        "crystal palace": ["Crystal Palace", "Palace", "CPFC"],
-        "nottingham forest": ["Nottingham Forest", "Forest", "NFFC"],
-        "afc bournemouth": ["AFC Bournemouth", "Bournemouth"],
-        "leicester city": ["Leicester", "Leicester City", "LCFC"],
-        "southampton": ["Southampton", "Saints"],
-        "aston villa": ["Aston Villa", "Villa", "AVFC"],
-        "paris saint-germain": ["Paris Saint-Germain", "PSG"],
-        "villarreal cf": ["Villarreal", "Villarreal CF"],
+    base = team_name.strip()
+    low = base.lower()
+    COMMON: Dict[str, List[str]] = {
+        "tottenham hotspur": ["Tottenham","Spurs","TOT"],
+        "manchester city": ["Manchester City","Man City","MCFC","City"],
+        "manchester united": ["Manchester United","Man United","Man Utd","MUFC","United"],
+        "newcastle united": ["Newcastle","NUFC"],
+        "west ham united": ["West Ham","WHUFC","West Ham United"],
+        "brighton & hove albion": ["Brighton","BHAFC","Brighton & Hove Albion"],
+        "liverpool": ["Liverpool","LFC"],
+        "arsenal": ["Arsenal","AFC"],
+        "chelsea": ["Chelsea","CFC"],
+        "crystal palace": ["Crystal Palace","Palace","CPFC"],
+        "nottingham forest": ["Nottingham Forest","Forest","NFFC"],
+        "afc bournemouth": ["AFC Bournemouth","Bournemouth"],
+        "leicester city": ["Leicester","Leicester City","LCFC"],
+        "southampton": ["Southampton","Saints"],
+        "aston villa": ["Aston Villa","Villa","AVFC"],
+        "paris saint-germain": ["Paris Saint-Germain","PSG"],
+        "villarreal cf": ["Villarreal","Villarreal CF"],
         "bristol rovers": ["Bristol Rovers"],
-        "burnley fc": ["Burnley", "Burnley FC"],
+        "burnley fc": ["Burnley","Burnley FC"],
+        "burnley": ["Burnley","Burnley FC"],
     }
-    
-    # Build alias set
-    cleaned_name = re.sub(r"\s*\([^)]*\)", "", base_name).strip()
-    aliases = {base_name, cleaned_name, cleaned_name.replace("FC", "").strip()}
-    
-    if lowercase_name in common_aliases:
-        aliases.update(common_aliases[lowercase_name])
-    
-    simplified_name = re.sub(r"\b(FC|CF|AFC|C\.F\.)\b", "", cleaned_name, 
-                           flags=re.I).strip()
-    if simplified_name:
-        aliases.add(simplified_name)
-    
-    return sorted({alias for alias in aliases if alias})
-
+    cleaned = re.sub(r"\s*\([^)]*\)", "", base).strip()
+    aliases = {base, cleaned, cleaned.replace("FC","").strip()}
+    if low in COMMON: aliases.update(COMMON[low])
+    simp = re.sub(r"\b(FC|CF|AFC|C\.F\.)\b","", cleaned, flags=re.I).strip()
+    if simp: aliases.add(simp)
+    return sorted(a for a in aliases if a)
 
 def build_reddit_queries(home_team: str, away_team: str) -> List[str]:
-    """Generate Reddit search queries for match threads."""
-    home_aliases = generate_team_aliases(home_team)
-    away_aliases = generate_team_aliases(away_team)
-    
-    home_query = " OR ".join(f'"{h}"' if " " in h else h for h in home_aliases)
-    away_query = " OR ".join(f'"{a}"' if " " in a else a for a in away_aliases)
+    H = generate_team_aliases(home_team)
+    A = generate_team_aliases(away_team)
+    H_or = " OR ".join(f'"{h}"' if " " in h else h for h in H)
+    A_or = " OR ".join(f'"{a}"' if " " in a else a for a in A)
 
-    keywords = [
-        '"Match Thread"', '"Post Match Thread"', '"Post-Match Thread"',
-        '"Pre Match Thread"', '"Pre-Match Thread"',
-        '"Full Time"', "FT", '"Player Ratings"', "Highlights"
+    KW = [
+        '"Match Thread"','"Post Match Thread"','"Post-Match Thread"',
+        '"Pre Match Thread"','"Pre-Match Thread"','"Full Time"',"FT",
+        '"Player Ratings"',"Highlights"
     ]
-    keywords_query = " OR ".join(keywords)
+    KW_or = " OR ".join(KW)
 
-    match_patterns = [
-        f'({home_query}) vs ({away_query})',
-        f'({away_query}) vs ({home_query})',
+    patterns = [
+        f'({H_or}) vs ({A_or})',
+        f'({A_or}) vs ({H_or})',
     ]
 
-    queries: List[str] = []
-    
-    # Add keyword + pattern combinations
-    for pattern in match_patterns:
-        queries.append(f'{keywords_query} {pattern}')
-        queries.append(f'"Match Thread" {pattern}')
-        queries.append(f'"Post Match Thread" {pattern}')
-        queries.append(f'"Full Time" {pattern}')
-    
-    # Add pattern-only queries
-    for pattern in match_patterns:
-        queries.append(pattern)
-    
-    # Add Tottenham-specific queries
-    queries.append(f'(Tottenham OR Spurs) vs ({away_query})')
-    queries.append(f'({away_query}) vs (Tottenham OR Spurs)')
+    q: List[str] = []
+    for p in patterns:
+        q.append(f'{KW_or} {p}')
+        q.append(f'"Match Thread" {p}')
+        q.append(f'"Post Match Thread" {p}')
+        q.append(f'"Full Time" {p}')
+    for p in patterns:
+        q.append(p)
+    q.append(f'(Tottenham OR Spurs) vs ({A_or})')
+    q.append(f'({A_or}) vs (Tottenham OR Spurs)')
 
-    # Remove duplicates while preserving order
-    unique_queries: List[str] = []
-    seen = set()
-    for query in queries:
-        query_key = query.lower()
-        if query_key not in seen:
-            seen.add(query_key)
-            unique_queries.append(query)
-    
-    return unique_queries
-
+    seen, uq = set(), []
+    for s in q:
+        k = s.lower()
+        if k not in seen:
+            seen.add(k); uq.append(s)
+    return uq
 
 def collect_reddit_data(subreddit_list: List[str], home_team: str, 
                         away_team: str, date_iso: str, window_days: int = 3,
                         per_query_limit: int = 100, max_posts_total: int = 600,
                         sleep_seconds: float = 0.25) -> Dict[str, Any]:
     """
-    Collect Reddit posts and comments for a match.
-
-    Strategy:
-      - Use time_filter="all" (no 1-month cap)
-      - Locally filter by created_utc within [start_time, end_time]
+    Use time_filter='all' and locally filter by created_utc within [start,end].
     """
     reddit = initialize_reddit()
     match_date = datetime.fromisoformat(date_iso)
@@ -445,69 +325,61 @@ def collect_reddit_data(subreddit_list: List[str], home_team: str,
     end_time   = to_epoch_time(match_date + timedelta(days=window_days))
 
     queries = build_reddit_queries(home_team, away_team)
-    seen_post_ids: set[str] = set()
+    seen_ids: set = set()
     posts: List[Dict[str, Any]] = []
 
-    for subreddit_name in subreddit_list:
-        subreddit = reddit.subreddit(subreddit_name)
-        for query in queries:
-            # KEY CHANGE: time_filter="all" (was "month")
-            for submission in subreddit.search(
-                query=query,
-                sort="new",
-                time_filter="all",
-                limit=per_query_limit
-            ):
-                post_id = submission.id
-                if post_id in seen_post_ids:
-                    continue
-
-                created_time = int(getattr(submission, "created_utc", 0))
-                # strict local date filter
-                if not (start_time <= created_time <= end_time):
-                    continue
-
-                posts.append({
-                    "id": post_id,
-                    "subreddit": subreddit_name,
-                    "title": submission.title,
-                    "score": int(getattr(submission, "score", 0)),
-                    "num_comments": int(getattr(submission, "num_comments", 0)),
-                    "created_utc": created_time,
-                    "url": submission.url,
-                    "permalink": f"https://reddit.com{submission.permalink}",
-                    "query": query,
-                })
-                seen_post_ids.add(post_id)
-
-                if len(posts) >= max_posts_total:
-                    break
-
+    for sub_name in subreddit_list:
+        sub = reddit.subreddit(sub_name)
+        for q in queries:
+            try:
+                for s in sub.search(query=q, sort="new", time_filter="all", limit=per_query_limit):
+                    pid = s.id
+                    if pid in seen_ids: 
+                        continue
+                    created = int(getattr(s, "created_utc", 0))
+                    if not (start_time <= created <= end_time):
+                        continue
+                    posts.append({
+                        "id": pid,
+                        "subreddit": sub_name,
+                        "title": s.title,
+                        "score": int(getattr(s, "score", 0)),
+                        "num_comments": int(getattr(s, "num_comments", 0)),
+                        "created_utc": created,
+                        "url": s.url,
+                        "permalink": f"https://reddit.com{s.permalink}",
+                        "query": q,
+                    })
+                    seen_ids.add(pid)
+                    if len(posts) >= max_posts_total:
+                        break
+            except Exception:
+                pass
             if len(posts) >= max_posts_total:
                 break
             time.sleep(sleep_seconds)
-
         if len(posts) >= max_posts_total:
             break
 
-    # Rank by engagement and recency
     posts.sort(key=lambda p: (p["score"], p["num_comments"], p["created_utc"]), reverse=True)
 
-    # Comment samples from top posts
+    # collect sample comments
     comments: List[Dict[str, Any]] = []
-    top_posts_limit = min(12, len(posts))
-    for post in posts[:top_posts_limit]:
-        submission = reddit.submission(id=post["id"])
-        submission.comments.replace_more(limit=0)
-        for comment in submission.comments[:80]:
-            comments.append({
-                "post_id": post["id"],
-                "id": comment.id,
-                "body": (getattr(comment, "body", "") or "")[:1000],
-                "score": int(getattr(comment, "score", 0)),
-                "created_utc": int(getattr(comment, "created_utc", 0)),
-            })
-        time.sleep(sleep_seconds)
+    for p in posts[: min(12, len(posts))]:
+        try:
+            subm = reddit.submission(id=p["id"])
+            subm.comments.replace_more(limit=0)
+            for c in subm.comments[:80]:
+                comments.append({
+                    "post_id": p["id"],
+                    "id": c.id,
+                    "body": (getattr(c, "body","") or "")[:1000],
+                    "score": int(getattr(c, "score", 0)),
+                    "created_utc": int(getattr(c, "created_utc", 0)),
+                })
+            time.sleep(sleep_seconds)
+        except Exception:
+            continue
 
     return {
         "posts": posts,
@@ -521,111 +393,123 @@ def collect_reddit_data(subreddit_list: List[str], home_team: str,
         },
     }
 
-
 def save_raw_reddit_data(reddit_bundle: Dict[str, Any], match_id: str) -> str:
-    """Save raw Reddit data bundle to structured directory."""
     ensure_directory(RAW_REDDIT_DIR)
-    file_path = os.path.join(RAW_REDDIT_DIR, f"{match_id}.json")
-    save_json(reddit_bundle, file_path)
-    return file_path
+    path = os.path.join(RAW_REDDIT_DIR, f"{match_id}.json")
+    save_json(reddit_bundle, path)
+    return path
 
-
-def clean_reddit_data(raw_reddit_directory: str, 
-                     matches_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    TRANSFORM phase: Process raw Reddit data into clean metrics.
-    
-    Calculate standardized engagement metrics from raw Reddit bundles.
-    """
-    metrics_rows = []
-    
-    for _, match_row in matches_df.iterrows():
-        match_id = match_row["match_id"]
-        raw_file_path = os.path.join(raw_reddit_directory, f"{match_id}.json")
-        
-        if not os.path.exists(raw_file_path):
-            print(f"Warning: No Reddit data found for {match_id}")
+def clean_reddit_data(raw_reddit_directory: str, matches_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, row in matches_df.iterrows():
+        match_id = row["match_id"]
+        raw_path = os.path.join(raw_reddit_directory, f"{match_id}.json")
+        if not os.path.exists(raw_path):
+            print(f"Warning: no Reddit data for {match_id}")
             continue
-            
-        # Load raw Reddit bundle
-        with open(raw_file_path, "r", encoding="utf-8") as file:
-            reddit_bundle = json.load(file)
-        
-        # Calculate engagement metrics
-        posts = reddit_bundle.get("posts", [])
-        comments = reddit_bundle.get("comments", [])
-        posts_count = len(posts)
-        comments_count = len(comments)
-        
-        if posts_count > 0:
-            avg_post_score = round(sum(p["score"] for p in posts) / posts_count, 2)
-            comments_per_post = round(comments_count / posts_count, 2)
-            top_post = max(posts, key=lambda p: p["score"])
-            high_engagement_posts = len([p for p in posts if p["score"] > 50])
-            avg_actual_comments = sum(p["num_comments"] for p in posts) / posts_count
+        with open(raw_path, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+
+        posts = bundle.get("posts", [])
+        comments = bundle.get("comments", [])
+        pc, cc = len(posts), len(comments)
+        if pc:
+            avg_post_score = round(sum(p.get("score", 0) for p in posts) / pc, 2)
+            comments_per_post = round(cc / pc, 2)
+            top_post = max(posts, key=lambda p: p.get("score", 0))
+            high_engagement_posts = sum(1 for p in posts if p.get("score", 0) > 50)
+            avg_actual_comments = round(sum(p.get("num_comments", 0) for p in posts) / pc, 2)
+            subs_covered = len({p.get("subreddit") for p in posts})
         else:
             avg_post_score = 0.0
             comments_per_post = 0.0
             top_post = {}
             high_engagement_posts = 0
             avg_actual_comments = 0.0
-        
-        metrics_row = {
+            subs_covered = 0
+
+        rows.append({
             "match_id": match_id,
-            "date": match_row["date"],
-            "home_team": match_row["home_team"],
-            "away_team": match_row["away_team"],
-            "competition": match_row["competition"],
-            "result": match_row["result"],
-            "posts_count": posts_count,
-            "comments_count": comments_count,
+            "date": row.get("date"),
+            "home_team": row.get("home_team"),
+            "away_team": row.get("away_team"),
+            "competition": row.get("competition"),
+            "result": row.get("result"),
+            "posts_count": pc,
+            "comments_count": cc,
             "avg_post_score": avg_post_score,
             "comments_per_post": comments_per_post,
             "high_engagement_posts": high_engagement_posts,
-            "avg_actual_comments_per_post": round(avg_actual_comments, 2),
+            "avg_actual_comments_per_post": avg_actual_comments,
             "top_post_title": top_post.get("title", ""),
             "top_post_score": top_post.get("score", 0),
             "top_post_url": top_post.get("permalink", ""),
-            "subreddits_covered": len(set(p["subreddit"] for p in posts)),
-            "collection_metadata": json.dumps(reddit_bundle.get("meta", {}))
-        }
-        metrics_rows.append(metrics_row)
-    
-    clean_df = pd.DataFrame(metrics_rows)
-    print(f"Clean Reddit metrics: {len(clean_df)} matches processed")
-    return clean_df
+            "subreddits_covered": subs_covered,
+            "collection_metadata": json.dumps(bundle.get("meta", {})),
+        })
+    df = pd.DataFrame(rows)
+    print(f"Clean Reddit metrics: {len(df)} matches processed")
+    return df
 
 
-def run_reddit_pipeline(matches_csv: str, limit_matches: int = 5,
-                       subreddit_list: Optional[List[str]] = None,
-                       window_days: int = 3) -> None:
-    """
-    Execute complete Reddit data collection and processing pipeline.
-    
-    1. EXTRACT: Collect raw Reddit data
-    2. TRANSFORM: Process into clean metrics
-    3. LOAD: Save to enriched directory
-    """
-    if not os.path.exists(matches_csv):
-        error_msg = f"{matches_csv} not found. Run Transfermarkt pipeline first."
-        raise FileNotFoundError(error_msg)
-    
-    matches_df = pd.read_csv(matches_csv).sort_values(by='date', ascending=False)
-    print(f"Collecting Reddit data for {min(limit_matches, len(matches_df))} matches...")
+# ============== USER SELECTION FOR REDDIT FETCH ======================
+def _print_match_menu(matches_df: pd.DataFrame) -> None:
+    print("\n=== Select matches to fetch Reddit data ===")
+    for i, r in enumerate(matches_df.itertuples(index=False), start=1):
+        print(f"{i:>2}. {r.date} — {r.home_team} vs {r.away_team} | "
+              f"{r.competition} | {r.result} | outcome={getattr(r,'outcome','')}")
 
+    print("\nEnter numbers like '1,3,5' or ranges like '2-4'. "
+          "Press ENTER to skip Reddit fetching.")
+
+def _parse_selection(user_input: str, max_n: int) -> List[int]:
+    s = (user_input or "").strip()
+    if not s: return []
+    picks = set()
+    for tok in s.split(","):
+        tok = tok.strip()
+        if not tok: continue
+        if "-" in tok:
+            try:
+                a,b = map(int, tok.split("-",1))
+                if a>b: a,b=b,a
+                for j in range(a,b+1):
+                    if 1<=j<=max_n: picks.add(j)
+            except Exception:
+                continue
+        else:
+            try:
+                j=int(tok)
+                if 1<=j<=max_n: picks.add(j)
+            except Exception:
+                continue
+    return sorted(picks)
+
+def run_reddit_pipeline_for_selected(matches_df: pd.DataFrame,
+                                     selected_indices: List[int],
+                                     subreddit_list: Optional[List[str]] = None,
+                                     window_days: int = 3) -> None:
     if subreddit_list is None:
-        subreddit_list = ["soccer", "coys", "PremierLeague", "soccerhighlights"]
+        subreddit_list = ["soccer","coys","PremierLeague","soccerhighlights"]
+    if not selected_indices:
+        print("No matches selected. Skipping Reddit collection.")
+        return
 
-    # Step 1: EXTRACT - Collect raw Reddit data
-    match_subset = matches_df.head(limit_matches)
-    iterable = match_subset.iterrows()
-    
-    if TQDM:
-        iterable = tqdm(iterable, total=len(match_subset), 
-                       desc="Reddit data collection")
+    # Take rows by 1-based indices, newest first for display consistency
+    sorted_df = matches_df.sort_values(by="date", ascending=False).reset_index(drop=True)
+    chosen = sorted_df.iloc[[i-1 for i in selected_indices if 1 <= i <= len(sorted_df)]]
+    if chosen.empty:
+        print("Selected indices out of range. Skipping.")
+        return
 
-    for _, row in iterable:
-        reddit_bundle = collect_reddit_data(
+    print(f"Collecting Reddit data for {len(chosen)} selected match(es)...")
+    iterator = tqdm(chosen.iterrows(), total=len(chosen), desc="Reddit data") if TQDM else chosen.iterrows()
+    for _, row in iterator:
+        raw_path = os.path.join(RAW_REDDIT_DIR, f"{row['match_id']}.json")
+        if os.path.exists(raw_path):
+            print(f"Skip (raw exists): {raw_path}")
+            continue
+        bundle = collect_reddit_data(
             subreddit_list=subreddit_list,
             home_team=row["home_team"],
             away_team=row["away_team"],
@@ -635,80 +519,74 @@ def run_reddit_pipeline(matches_csv: str, limit_matches: int = 5,
             max_posts_total=600,
             sleep_seconds=0.25
         )
-        
-        raw_file_path = save_raw_reddit_data(reddit_bundle, row['match_id'])
-        print(f"Raw Reddit data saved: {raw_file_path}")
+        save_raw_reddit_data(bundle, row["match_id"])
+        print(f"Saved raw: {raw_path}")
 
-    # Step 2: TRANSFORM - Clean and process raw data
-    print("Processing raw Reddit data...")
-    clean_reddit_df = clean_reddit_data(RAW_REDDIT_DIR, match_subset)
-    
-    # Step 3: LOAD - Save clean data
-    save_csv(clean_reddit_df, ENRICHED_REDDIT)
-    print(f"Clean Reddit metrics saved: {ENRICHED_REDDIT} "
-          f"({len(clean_reddit_df)} rows)")
+    # Process only chosen matches, then merge with existing metrics
+    print("Processing raw Reddit data for selected matches...")
+    processed = clean_reddit_data(RAW_REDDIT_DIR, chosen)
+    if os.path.exists(ENRICHED_REDDIT):
+        cur = pd.read_csv(ENRICHED_REDDIT)
+        cur = cur[~cur["match_id"].isin(processed["match_id"])]
+        merged = pd.concat([cur, processed], ignore_index=True)
+    else:
+        merged = processed
+    save_csv(merged, ENRICHED_REDDIT)
+    print(f"Clean Reddit metrics saved: {ENRICHED_REDDIT} ({len(merged)} rows)")
 
 
+# =========================== MAIN ORCHESTRATION ======================
 def main() -> None:
-    """
-    Main ETL pipeline orchestration function.
-    
-    Executes: Extract → Transform → Load → Enrich workflow
-    Following assignment requirements exactly.
-    """
     print("Starting Spurs excitement analysis pipeline...")
-    
-    # STEP 1: EXTRACT - Scrape raw Transfermarkt data
-    print("\n=== STEP 1: EXTRACT ===")
-    print("Scraping raw Transfermarkt data...")
-    raw_transfermarkt_df = scrape_raw_transfermarkt(TRANSFERMARKT_URL)
-    
-    if raw_transfermarkt_df.empty:
-        print("ERROR: No data scraped. Check page structure.")
+
+    # STEP 1: EXTRACT — Transfermarkt
+    print("\n=== STEP 1: EXTRACT (Transfermarkt) ===")
+    raw_df = scrape_raw_transfermarkt(TRANSFERMARKT_URL)
+    if raw_df.empty:
+        print("❗ No data scraped. Check page structure.")
         return
-    
-    save_csv(raw_transfermarkt_df, RAW_TRANSFERMARKT)
-    print(f"Raw Transfermarkt data saved: {RAW_TRANSFERMARKT} "
-          f"({len(raw_transfermarkt_df)} rows)")
+    save_csv(raw_df, RAW_TRANSFERMARKT)
+    print(f"Saved raw Transfermarkt: {RAW_TRANSFERMARKT} ({len(raw_df)} rows)")
 
-    # STEP 2: TRANSFORM - Clean Transfermarkt data
-    print("\n=== STEP 2: TRANSFORM ===")
-    print("Cleaning Transfermarkt data...")
-    clean_transfermarkt_df = clean_transfermarkt_data(RAW_TRANSFERMARKT)
-    save_csv(clean_transfermarkt_df, ENRICHED_MATCHES)
-    print(f"Clean matches saved: {ENRICHED_MATCHES} "
-          f"({len(clean_transfermarkt_df)} rows)")
+    # STEP 2: TRANSFORM — Clean matches
+    print("\n=== STEP 2: TRANSFORM (Clean matches) ===")
+    clean_df = clean_transfermarkt_data(RAW_TRANSFERMARKT)
+    save_csv(clean_df, ENRICHED_MATCHES)
+    print(f"Saved clean matches: {ENRICHED_MATCHES} ({len(clean_df)} rows)")
 
-    # STEP 3: EXTRACT & TRANSFORM - Reddit data pipeline
-    print("\n=== STEP 3: REDDIT PIPELINE ===")
-    run_reddit_pipeline(
-        matches_csv=ENRICHED_MATCHES,
-        limit_matches=10,
-        subreddit_list=["soccer", "coys", "PremierLeague", "soccerhighlights"],
-        window_days=3
-    )
+    # STEP 3: Reddit — user selects which matches to fetch
+    print("\n=== STEP 3: REDDIT (select matches) ===")
+    menu_df = clean_df.sort_values(by="date", ascending=False).reset_index(drop=True)
+    _print_match_menu(menu_df)
+    selected = _parse_selection(input("\nSelect matches (e.g., 1,3,5 or 2-4). ENTER to skip: "), len(menu_df))
+    if selected:
+        run_reddit_pipeline_for_selected(
+            matches_df=clean_df,
+            selected_indices=selected,
+            subreddit_list=["soccer","coys","PremierLeague","soccerhighlights"],
+            window_days=3
+        )
+    else:
+        print("No selection. Skipping Reddit collection.")
 
-    # STEP 4: ENRICH - DeepSeek AI enhancement
-    print("\n=== STEP 4: ENRICH ===")
-    print("Running DeepSeek AI enrichment...")
+    # STEP 4: ENRICH — DeepSeek scoring (uses existing metrics CSV)
+    print("\n=== STEP 4: ENRICH (DeepSeek) ===")
     run_deepseek_enrichment(
         matches_csv=ENRICHED_MATCHES,
         reddit_metrics_csv=ENRICHED_REDDIT,
         out_csv=FINAL_SCORES
     )
-    
-    # STEP 5: Summary
-    print("\n=== PIPELINE COMPLETE ===")
-    print("File structure:")
-    print("  data/raw/ - Raw scraped data (debugging/audit trail)")  
-    print("  data/enriched/ - Clean processed data")
-    print(f"  {FINAL_SCORES} - Final AI-enhanced results")
-    print("\nPipeline completed successfully!")
 
-    # STEP 6: Display final results
+    # STEP 5: Show summary
+    print("\n=== PIPELINE COMPLETE ===")
+    print("Outputs:")
+    print(f"  - {RAW_TRANSFERMARKT}")
+    print(f"  - {ENRICHED_MATCHES}")
+    print(f"  - {RAW_REDDIT_DIR}/<match_id>.json")
+    print(f"  - {ENRICHED_REDDIT}")
+    print(f"  - {FINAL_SCORES}")
     print_deepseek_results(limit=10)
 
 
 if __name__ == "__main__":
-    # main()
-    print_deepseek_results(limit=10)
+    main()
