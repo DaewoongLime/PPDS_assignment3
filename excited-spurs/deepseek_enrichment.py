@@ -47,8 +47,15 @@ def _deepseek_chat(messages: List[Dict[str, str]], temperature: float = 0.2) -> 
     response.raise_for_status()
     return response.json()
 
-def _calculate_pre_score(match_row: dict, metrics: dict) -> float:
-    """Calculate heuristic pre-score in 0–70 range to guide the LLM assessment"""
+def _calculate_spurs_fan_excitement_baseline(match_row: dict, 
+                                           metrics: dict) -> float:
+    """
+    Calculate Tottenham fan excitement baseline (0-70) considering:
+    - Spurs fans are more excited by wins than neutrals
+    - Losses against rivals are especially painful  
+    - Late drama and comebacks are peak excitement
+    - European competitions matter more
+    """
     posts_count = metrics.get("posts_count", 0)
     comments_count = metrics.get("comments_count", 0)
     avg_post_score = metrics.get("avg_post_score", 0.0)
@@ -59,134 +66,231 @@ def _calculate_pre_score(match_row: dict, metrics: dict) -> float:
     volume_metric = math.log(1 + posts_count + comments_count)
     volume_score = min(25.0, volume_metric * 6.0)
 
-    # Quality score (max ~15 points)
-    quality_score = max(0.0, min(15.0, (avg_post_score/50.0)*7 + (comments_per_post/20.0)*8))
+    # Quality/engagement score (max ~15 points)
+    quality_score = max(0.0, min(15.0, (avg_post_score/50.0)*7 + 
+                                (comments_per_post/20.0)*8))
 
-    # Drama score (max ~15 points) based on goal difference
-    goal_difference = 0
+    # Result-based excitement for Spurs fans (max ~20 points)
     result = (match_row.get("result") or "")
+    venue = match_row.get("venue", "")
+    spurs_excitement = 0.0
+    
     if ":" in result or "-" in result:
         home_goals, away_goals = result.replace("-", ":").split(":")[:2]
         try:
-            goal_difference = abs(int(home_goals) - int(away_goals))
+            home_goals, away_goals = int(home_goals), int(away_goals)
+            
+            if venue == "Home":
+                spurs_goals, opponent_goals = home_goals, away_goals
+            else:
+                spurs_goals, opponent_goals = away_goals, home_goals
+            
+            # Spurs fan excitement based on result
+            if spurs_goals > opponent_goals:  # Win
+                goal_diff = spurs_goals - opponent_goals
+                if goal_diff == 1:  # Narrow win - most exciting
+                    spurs_excitement = 20.0
+                elif goal_diff == 2:  # Comfortable win
+                    spurs_excitement = 18.0
+                elif spurs_goals >= 4:  # Thrashing - exciting but rare
+                    spurs_excitement = 19.0
+                else:  # Big win
+                    spurs_excitement = 15.0
+            elif spurs_goals == opponent_goals:  # Draw
+                if spurs_goals >= 2:  # High-scoring draw
+                    spurs_excitement = 12.0
+                else:  # Boring draw
+                    spurs_excitement = 6.0
+            else:  # Loss - excitement depends on context
+                goal_diff = opponent_goals - spurs_goals
+                if goal_diff == 1:  # Narrow loss - still dramatic
+                    spurs_excitement = 8.0
+                elif spurs_goals >= 2:  # High-scoring loss
+                    spurs_excitement = 7.0
+                else:  # Bad loss
+                    spurs_excitement = 3.0
+                    
         except Exception:
-            goal_difference = 0
-    
-    # Drama scoring: 1-goal difference = highest drama
-    if goal_difference == 1:
-        drama_score = 15.0
-    elif goal_difference == 2:
-        drama_score = 10.0
-    elif goal_difference == 0:  # Draw
-        drama_score = 5.0
-    else:
-        drama_score = 2.0
+            spurs_excitement = 5.0
 
-    # Context score (max ~10 points) - big competitions and rivals
+    # Opposition and competition context (max ~15 points)
     competition = (match_row.get("competition") or "").lower()
-    opponent = (match_row.get("away_team") or "").lower()
+    opponent = ""
     
-    is_big_competition = any(keyword in competition for keyword in ["champions", "ucl", "final", "semi"])
-    is_big_rival = any(rival in opponent for rival in [
-        "arsenal", "chelsea", "manchester", "liverpool", "city", "united", "newcastle"
-    ])
-    context_score = 10.0 if (is_big_competition or is_big_rival) else 4.0
+    # Get opponent name correctly based on venue
+    if venue == "Home":
+        opponent = (match_row.get("away_team") or "").lower()
+    else:
+        opponent = (match_row.get("home_team") or "").lower()
+    
+    # Big Six rivals - higher stakes
+    big_rivals = ["arsenal", "chelsea", "manchester united", "manchester city", 
+                  "liverpool"]
+    london_rivals = ["arsenal", "chelsea", "west ham", "brentford", "fulham", 
+                     "crystal palace"]
+    
+    # Competition importance
+    competition_multiplier = 1.0
+    if any(comp in competition for comp in ["champions", "europa", "conference"]):
+        competition_multiplier = 1.5
+    elif "cup" in competition or "trophy" in competition:
+        competition_multiplier = 1.2
+    elif "premier league" in competition:
+        competition_multiplier = 1.0
+    
+    context_score = 5.0  # Base score
+    if any(rival in opponent for rival in big_rivals):
+        context_score = 12.0  # Big rivalry
+    elif any(rival in opponent for rival in london_rivals):
+        context_score = 8.0   # London derby
+    
+    context_score *= competition_multiplier
+    context_score = min(15.0, context_score)
 
-    # Attendance score (max ~5 points)
+    # Attendance factor (max ~5 points) - home atmosphere matters
     attendance = match_row.get("attendance") or 0
-    attendance_score = min(5.0, attendance/10000.0)
+    attendance_score = min(5.0, attendance/12000.0)  # Scale for smaller stadiums
 
-    total_score = volume_score + quality_score + drama_score + context_score + attendance_score
-    return round(total_score, 2)
+    total_baseline = (volume_score + quality_score + 
+                     spurs_excitement + context_score + attendance_score)
+    return round(min(70.0, total_baseline), 2)
 
-# System prompt for DeepSeek AI
-SYSTEM_PROMPT = """You are a sports data analyst specializing in fan excitement measurement.
-Given match metadata, Reddit engagement signals, and a heuristic pre-score (0–70 range), you must produce:
-- A final excitement_score (0–100 scale)
-- 3–5 concise descriptive tags
-- A 2–3 sentence summary of the match excitement
-- 2–4 bullet point reasons explaining your adjustments to the pre-score (+/-)
+# System prompt optimized for Tottenham fan perspective
+TOTTENHAM_FAN_SYSTEM_PROMPT = """You are a Tottenham Hotspur fan and data analyst specializing in measuring match excitement from a Spurs supporter's perspective.
 
-Be concise, evidence-based, and output strict JSON format only."""
+Your job: Analyze match data and Reddit reactions to score how exciting/enjoyable each match was for Tottenham fans specifically (0-100 scale).
 
-# User prompt template for DeepSeek API
-USER_PROMPT_TEMPLATE = """Match Metadata:
-{match_meta}
+Key Tottenham fan psychology to consider:
+- WINS are always more exciting than draws/losses (especially against rivals)
+- Narrow wins (1-goal) are peak excitement - shows character and drama
+- Losses against Arsenal, Chelsea, Man City, Liverpool are particularly painful
+- European competition matches matter more than league games
+- Late goals, comebacks, and dramatic moments amplify excitement
+- Boring 0-0 draws are the worst possible outcome
+- High-scoring games are exciting even if we lose (shows attacking football)
+- Away wins are more satisfying than home wins
 
-Reddit Engagement Metrics:
+Output requirements:
+- excitement_score: 0-100 integer (Tottenham fan excitement level)
+- tags: 3-5 short descriptive tags
+- summary: 2-3 sentences from a Spurs fan perspective  
+- reasons: 3-4 bullet points explaining your scoring
+
+Be realistic about Spurs fan emotions. Output JSON only."""
+
+# User prompt template optimized for fan excitement analysis
+TOTTENHAM_FAN_PROMPT_TEMPLATE = """MATCH ANALYSIS REQUEST
+
+Match Details:
+{match_metadata}
+
+Reddit Fan Engagement:
 {reddit_metrics}
 
-Sample Reddit Content Analysis:
-- Top Post Titles: {post_titles}
+Sample Fan Reactions:
+- Post Titles: {post_titles}
 - Comment Samples: {comment_samples}
 
-Heuristic Pre-Score (0–70 baseline): {pre_score}
+Baseline Excitement Score: {baseline_score}/70
 
-Analysis Guidelines:
-- Adjust the pre-score to create a final 0–100 excitement_score
-- Typical adjustments should be within ±20 points unless extraordinary circumstances
-- Consider match drama (scoreline), competition importance, and Reddit reaction volume/quality
-- Tags should be concise (1–3 words each)
-- Focus on objective fan excitement indicators
+ANALYSIS INSTRUCTIONS:
+- Convert baseline to final 0-100 excitement score for Tottenham fans
+- Consider: Did Spurs win/lose? Against whom? How dramatic was it?
+- Reddit volume/sentiment indicates fan emotional response
+- Adjust baseline based on Spurs-specific context
 
-Return JSON format ONLY:
+Scoring Guide:
+- 90-100: Legendary matches (big wins, dramatic comebacks, rival thrashings)
+- 75-89: Great matches (solid wins, exciting games, good performances)
+- 50-74: Decent matches (acceptable results, some entertainment)
+- 25-49: Disappointing matches (poor performances, bad losses)
+- 0-24: Terrible matches (humiliating defeats, boring draws)
+
+Return JSON only:
 {{
-  "excitement_score": <integer 0-100>,
-  "tags": ["tag1", "tag2", "tag3"],
-  "summary": "<2–3 sentences describing fan excitement>",
-  "reasons": ["reason 1", "reason 2", "reason 3"]
-}}
-"""
+  "excitement_score": <0-100 integer>,
+  "tags": ["tag1", "tag2", "tag3", "tag4"],
+  "summary": "<Fan perspective 2-3 sentences>",
+  "reasons": ["adjustment reason 1", "reason 2", "reason 3", "reason 4"]
+}}"""
 
-def _enrich_single_match(match_row: dict, reddit_bundle: dict, reddit_metrics: dict) -> dict:
-    """Process a single match through DeepSeek AI for excitement scoring"""
+def _enrich_single_match_for_spurs_fans(match_row: dict, reddit_bundle: dict, 
+                                       reddit_metrics: dict) -> dict:
+    """
+    Process a single match through DeepSeek AI for Tottenham fan excitement scoring.
+    
+    Uses Spurs-specific prompts and baseline calculation to get realistic
+    fan excitement ratings rather than neutral sports analysis.
+    """
     posts = reddit_bundle.get("posts", [])
     comments = reddit_bundle.get("comments", [])
     
     # Extract sample content for AI analysis
     post_titles = [post.get("title", "") for post in posts[:5]]
-    comment_samples = [comment.get("body", "")[:180] for comment in comments[:5]]
+    comment_samples = [comment.get("body", "")[:200] for comment in comments[:8]]
 
-    # Calculate baseline pre-score
-    pre_score = _calculate_pre_score(match_row, reddit_metrics)
+    # Calculate Spurs fan baseline excitement
+    baseline_score = _calculate_spurs_fan_excitement_baseline(match_row, reddit_metrics)
     
-    # Format prompt for DeepSeek API
-    user_prompt = USER_PROMPT_TEMPLATE.format(
-        match_meta=json.dumps(match_row, ensure_ascii=False),
-        reddit_metrics=json.dumps(reddit_metrics, ensure_ascii=False),
-        post_titles=json.dumps(post_titles, ensure_ascii=False),
-        comment_samples=json.dumps(comment_samples, ensure_ascii=False),
-        pre_score=pre_score
+    # Format match metadata for better AI understanding
+    match_metadata = {
+        "date": match_row.get("date"),
+        "opponent": (match_row.get("away_team") if match_row.get("venue") == "Home" 
+                    else match_row.get("home_team")),
+        "venue": match_row.get("venue"),
+        "competition": match_row.get("competition"),
+        "result": match_row.get("result"),
+        "attendance": match_row.get("attendance")
+    }
+    
+    # Create Tottenham fan-focused prompt
+    user_prompt = TOTTENHAM_FAN_PROMPT_TEMPLATE.format(
+        match_metadata=json.dumps(match_metadata, ensure_ascii=False, indent=2),
+        reddit_metrics=json.dumps(reddit_metrics, ensure_ascii=False, indent=2),
+        post_titles=json.dumps(post_titles, ensure_ascii=False, indent=2),
+        comment_samples=json.dumps(comment_samples, ensure_ascii=False, indent=2),
+        baseline_score=baseline_score
     )
 
-    # Make API call to DeepSeek
-    response = _deepseek_chat([
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt}
-    ])
-    
-    # Parse JSON response safely
-    response_text = response["choices"][0]["message"]["content"]
-    json_start = response_text.find("{")
-    json_end = response_text.rfind("}")
-    
-    parsed_data = {}
     try:
+        # Make API call to DeepSeek with Spurs fan context
+        response = _deepseek_chat([
+            {"role": "system", "content": TOTTENHAM_FAN_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ], temperature=0.3)  # Slightly more creative for fan perspective
+        
+        # Parse JSON response safely
+        response_text = response["choices"][0]["message"]["content"]
+        json_start = response_text.find("{")
+        json_end = response_text.rfind("}")
+        
+        parsed_data = {}
         if json_start != -1 and json_end != -1:
             json_content = response_text[json_start:json_end+1]
             parsed_data = json.loads(json_content)
+            
     except Exception as e:
-        print(f"Warning: Failed to parse JSON response: {e}")
+        print(f"Warning: DeepSeek API call failed: {e}")
         parsed_data = {}
     
-    # Fallback scoring if JSON parsing fails
-    fallback_score = max(0, min(100, int(pre_score * 1.3)))
+    # Fallback scoring with Spurs fan bias if API fails
+    fallback_score = max(10, min(100, int(baseline_score * 1.4)))
+    
+    # Extract results with fan-appropriate defaults
+    excitement_score = int(parsed_data.get("excitement_score", fallback_score))
+    tags = parsed_data.get("tags", ["spurs-match"])
+    summary = parsed_data.get("summary", "Match analysis unavailable")
+    reasons = parsed_data.get("reasons", ["API analysis failed"])
+    
+    # Ensure excitement score is reasonable (0-100)
+    excitement_score = max(0, min(100, excitement_score))
     
     return {
-        "excitement_score": int(parsed_data.get("excitement_score", fallback_score)),
-        "tags": parsed_data.get("tags", []),
-        "summary": parsed_data.get("summary", ""),
-        "reasons": parsed_data.get("reasons", [])
+        "excitement_score": excitement_score,
+        "tags": tags,
+        "summary": summary,
+        "reasons": reasons,
+        "baseline_score": baseline_score  # Keep for debugging
     }
 
 def run_deepseek_enrichment(
@@ -220,7 +324,7 @@ def run_deepseek_enrichment(
     enriched_rows: List[Dict[str, Any]] = []
     
     # Process each match with Reddit data
-    for _, reddit_row in reddit_df.iterrows():
+    for _, reddit_row in reddit_df.iloc[::-1].iterrows():
         match_id = reddit_row["match_id"]
         match_metadata = matches_by_id.get(match_id, {})
         
@@ -232,8 +336,8 @@ def run_deepseek_enrichment(
             with open(reddit_bundle_path, "r", encoding="utf-8") as file:
                 reddit_bundle = json.load(file)
 
-        # Process through DeepSeek AI
-        enrichment_results = _enrich_single_match(
+        # Process through DeepSeek AI with Spurs fan perspective
+        enrichment_results = _enrich_single_match_for_spurs_fans(
             match_metadata, 
             reddit_bundle, 
             reddit_row.to_dict()
@@ -262,3 +366,30 @@ def run_deepseek_enrichment(
     output_df = pd.DataFrame(enriched_rows)
     _save_csv(output_df, out_csv)
     print(f"✨ DeepSeek excitement scores saved: {out_csv} (rows={len(output_df)})")
+
+def print_deepseek_results(csv_path: str = "data/enriched/excitement_scores.csv", limit: int = 5):
+    """
+    Pretty-print DeepSeek enrichment results.
+    - csv_path: path to the excitement_scores.csv file
+    - limit: number of matches to display (default 5)
+    """
+    if not os.path.exists(csv_path):
+        print(f"❗ File not found: {csv_path}. Run enrichment first.")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print("❗ No rows in results.")
+        return
+
+    for _, row in df.head(limit).iterrows():
+        print("────────────────────────────")
+        print(f"{row['date']} — {row['home_team']} vs {row['away_team']}")
+        print(f"Competition : {row['competition']}")
+        print(f"Result      : {row['result']}")
+        print(f"Attendance  : {row['attendance']}")
+        print(f"Excitement  : {row['excitement_score']}/100")
+        print(f"Tags        : {row['tags']}")
+        print(f"Summary     : {row['ai_summary']}")
+        print(f"Reasons     : {row['analysis_reasons']}")
+    print("────────────────────────────")
